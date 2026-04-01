@@ -1,0 +1,19 @@
+{
+  "name": "navkankari",
+  "version": "1.0.0",
+  "description": "Navkankari full-stack local multiplayer board game",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node server/app.js",
+    "build": "node scripts/build.mjs",
+    "start": "node dist/server/app.cjs"
+  },
+  "dependencies": {
+    "esbuild": "^0.25.3",
+    "express": "^5.1.0",
+    "javascript-obfuscator": "^4.1.1",
+    "pg": "^8.20.0",
+    "socket.io": "^4.8.1"
+  }
+}
