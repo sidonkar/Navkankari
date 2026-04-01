@@ -5,7 +5,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { Server } from "socket.io";
 import {
-  PLAYER_COLORS,
   RANKING,
   createGameRecord,
   applyGameAction,
@@ -18,12 +17,16 @@ const DIST_PUBLIC = path.join(ROOT, "dist", "public");
 const DIST_SERVER = path.join(ROOT, "dist", "server");
 const SRC_DIR = path.join(ROOT, "src");
 const SECRET = process.env.NAVKANKARI_SECRET || "navkankari-local-secret";
-const PORT = Number(process.env.PORT || 3000);
+const PORT = Number(process.env.PORT || 7000);
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 const socketsByPlayer = new Map();
+const presenceByPlayer = new Map();
+const idleStateByPlayer = new Map();
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const PRESENCE_SWEEP_MS = 15 * 1000;
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -39,6 +42,14 @@ function uid(prefix) {
 
 function sanitizeName(value) {
   return String(value || "").trim().replace(/\s+/g, " ").slice(0, 24);
+}
+
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizePhone(value) {
+  return String(value || "").replace(/[^\d+]/g, "").slice(0, 20);
 }
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
@@ -87,17 +98,46 @@ function createToken(playerId) {
   });
 }
 
+function isPlayerOnline(playerId) {
+  return socketsByPlayer.has(playerId);
+}
+
+function isPlayerIdle(playerId) {
+  if (!isPlayerOnline(playerId)) {
+    return false;
+  }
+  const presence = presenceByPlayer.get(playerId);
+  if (!presence?.lastActiveAt) {
+    return false;
+  }
+  return Date.now() - presence.lastActiveAt >= IDLE_TIMEOUT_MS;
+}
+
+function markPlayerActive(playerId) {
+  presenceByPlayer.set(playerId, { lastActiveAt: Date.now() });
+}
+
+function syncIdleState(playerId) {
+  const nextIdle = isPlayerIdle(playerId);
+  const previousIdle = idleStateByPlayer.get(playerId);
+  idleStateByPlayer.set(playerId, nextIdle);
+  return previousIdle !== undefined && previousIdle !== nextIdle;
+}
+
 function publicPlayer(player) {
   return {
     id: player.id,
     name: player.name,
-    favoriteColor: player.favoriteColor,
+    email: player.email || "",
+    phone: player.phone || "",
     gamesPlayed: player.gamesPlayed,
     wins: player.wins,
     losses: player.losses,
     rating: player.rating,
     activeGameId: player.activeGameId,
-    guest: Boolean(player.guest)
+    guest: Boolean(player.guest),
+    online: isPlayerOnline(player.id),
+    idle: isPlayerIdle(player.id)
   };
 }
 
@@ -111,6 +151,14 @@ function getGame(store, gameId) {
 
 function getActiveGameFor(store, playerId) {
   return store.games.find((game) => game.status === "active" && game.playerIds.includes(playerId)) || null;
+}
+
+function getCurrentGameFor(store, playerId) {
+  const player = getPlayer(store, playerId);
+  if (!player?.activeGameId) {
+    return null;
+  }
+  return getGame(store, player.activeGameId);
 }
 
 function getSavedGamesFor(store, playerId) {
@@ -172,14 +220,12 @@ function settleFinishedGame(store, game) {
     winner.gamesPlayed += 1;
     winner.wins += 1;
     winner.rating += RANKING.win;
-    winner.activeGameId = null;
   }
 
   if (loser) {
     loser.gamesPlayed += 1;
     loser.losses += 1;
     loser.rating = Math.max(RANKING.floor, loser.rating + RANKING.loss);
-    loser.activeGameId = null;
   }
 
   game.resultRecorded = true;
@@ -270,7 +316,7 @@ function buildDashboard(store, playerId) {
     .map(publicPlayer);
 
   const availablePlayers = store.players
-    .filter((entry) => entry.id !== playerId && !entry.activeGameId)
+    .filter((entry) => entry.id !== playerId && !entry.activeGameId && isPlayerOnline(entry.id) && !isPlayerIdle(entry.id))
     .map(publicPlayer);
 
   const openChallenges = store.queue
@@ -311,9 +357,16 @@ function pushDashboard(store, playerId) {
 }
 
 function pushGame(store, playerId) {
-  const game = getActiveGameFor(store, playerId);
+  const game = getCurrentGameFor(store, playerId);
   const sockets = socketsByPlayer.get(playerId) || [];
   sockets.forEach((socket) => socket.emit("game:update", serializeGame(game, playerId)));
+}
+
+function pushNotice(playerIds, message) {
+  [...new Set(playerIds)].forEach((playerId) => {
+    const sockets = socketsByPlayer.get(playerId) || [];
+    sockets.forEach((socket) => socket.emit("notice", { message }));
+  });
 }
 
 function pushPlayers(store, playerIds) {
@@ -321,6 +374,25 @@ function pushPlayers(store, playerIds) {
     pushDashboard(store, playerId);
     pushGame(store, playerId);
   });
+}
+
+function pushAllOnlineDashboards(store) {
+  [...socketsByPlayer.keys()].forEach((playerId) => {
+    pushDashboard(store, playerId);
+  });
+}
+
+async function broadcastAllOnlineDashboards() {
+  const store = await readStore();
+  pushAllOnlineDashboards(store);
+}
+
+function actorPayload(store, playerId) {
+  return {
+    user: publicPlayer(getPlayer(store, playerId)),
+    dashboard: buildDashboard(store, playerId),
+    game: serializeGame(getCurrentGameFor(store, playerId), playerId)
+  };
 }
 
 function matchmake(store, challengerId) {
@@ -382,7 +454,7 @@ function renderIndex(useBuiltAssets) {
     <title>Navkankari</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="${stylesheet}">
   </head>
   <body>
@@ -396,28 +468,36 @@ function renderIndex(useBuiltAssets) {
 app.get("/api/bootstrap", async (req, res) => {
   const auth = await currentAuthPlayer(req);
   if (!auth) {
-    res.json({ user: null, dashboard: null, game: null, config: { colors: PLAYER_COLORS } });
+    res.json({ user: null, dashboard: null, game: null, config: {} });
     return;
   }
 
   const { player, store } = auth;
   const dashboard = buildDashboard(store, player.id);
-  const game = getActiveGameFor(store, player.id);
+  const game = getCurrentGameFor(store, player.id);
   res.json({
     user: publicPlayer(player),
     dashboard,
     game: serializeGame(game, player.id),
-    config: { colors: PLAYER_COLORS }
+    config: {}
   });
 });
 
 app.post("/api/auth/register", async (req, res) => {
   const name = sanitizeName(req.body.name);
+  const email = normalizeEmail(req.body.email);
+  const phone = normalizePhone(req.body.phone);
   const password = String(req.body.password || "").trim();
-  const favoriteColor = String(req.body.favoriteColor || PLAYER_COLORS[0].value);
-
-  if (!name || !password) {
-    res.status(400).json({ error: "Name and password are required." });
+  if (!name || !email || !phone || !password) {
+    res.status(400).json({ error: "Name, email, phone number, and password are required." });
+    return;
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    res.status(400).json({ error: "Enter a valid email address." });
+    return;
+  }
+  if (phone.replace(/\D/g, "").length < 10) {
+    res.status(400).json({ error: "Enter a valid phone number." });
     return;
   }
 
@@ -425,14 +505,18 @@ app.post("/api/auth/register", async (req, res) => {
     if (draft.players.some((player) => player.name.toLowerCase() === name.toLowerCase())) {
       return { error: "That player name is already taken." };
     }
+    if (draft.players.some((player) => normalizeEmail(player.email) === email)) {
+      return { error: "That email is already in use." };
+    }
 
     const { salt, passwordHash } = hashPassword(password);
     const player = {
       id: uid("player"),
       name,
+      email,
+      phone,
       salt,
       passwordHash,
-      favoriteColor,
       gamesPlayed: 0,
       wins: 0,
       losses: 0,
@@ -480,55 +564,37 @@ app.post("/api/auth/login", async (req, res) => {
     token: createToken(player.id),
     user: publicPlayer(player),
     dashboard: buildDashboard(store, player.id),
-    game: serializeGame(getActiveGameFor(store, player.id), player.id)
+    game: serializeGame(getCurrentGameFor(store, player.id), player.id)
   });
 });
 
-app.post("/api/auth/guest", async (req, res) => {
-  const favoriteColor = String(req.body.favoriteColor || PLAYER_COLORS[1].value);
+app.post("/api/auth/forgot-password", async (req, res) => {
+  const name = sanitizeName(req.body.name);
+  const email = normalizeEmail(req.body.email);
+  const password = String(req.body.password || "").trim();
+  if (!name || !email || !password) {
+    res.status(400).json({ error: "Name, email, and new password are required." });
+    return;
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    res.status(400).json({ error: "Enter a valid email address." });
+    return;
+  }
 
-  const { store, result } = await withStore(async (draft) => {
-    let guestName = "";
-    do {
-      guestName = `Guest ${Math.floor(Math.random() * 900 + 100)}`;
-    } while (draft.players.some((player) => player.name === guestName));
-
-    const player = {
-      id: uid("guest"),
-      name: guestName,
-      salt: "",
-      passwordHash: "",
-      favoriteColor,
-      gamesPlayed: 0,
-      wins: 0,
-      losses: 0,
-      rating: RANKING.base,
-      activeGameId: null,
-      guest: true,
-      createdAt: Date.now()
-    };
-
-    draft.players.push(player);
-    return { player };
-  });
-
-  res.json({
-    token: createToken(result.player.id),
-    user: publicPlayer(result.player),
-    dashboard: buildDashboard(store, result.player.id),
-    game: null
-  });
-});
-
-app.post("/api/profile/color", requireAuth, async (req, res) => {
-  const favoriteColor = String(req.body.favoriteColor || "");
-  const { store, result } = await withStore(async (draft) => {
-    const player = getPlayer(draft, req.auth.player.id);
+  const { result } = await withStore(async (draft) => {
+    const player = draft.players.find((entry) =>
+      entry.name.toLowerCase() === name.toLowerCase()
+      && normalizeEmail(entry.email) === email
+      && !entry.guest
+    );
     if (!player) {
-      return { error: "Player not found." };
+      return { error: "Name and email did not match any player." };
     }
-    player.favoriteColor = favoriteColor || player.favoriteColor;
-    return { player };
+
+    const { salt, passwordHash } = hashPassword(password);
+    player.salt = salt;
+    player.passwordHash = passwordHash;
+    return { ok: true };
   });
 
   if (result.error) {
@@ -536,8 +602,7 @@ app.post("/api/profile/color", requireAuth, async (req, res) => {
     return;
   }
 
-  pushDashboard(store, result.player.id);
-  res.json({ ok: true, user: publicPlayer(result.player) });
+  res.json({ ok: true });
 });
 
 app.post("/api/invites", requireAuth, async (req, res) => {
@@ -574,7 +639,8 @@ app.post("/api/invites", requireAuth, async (req, res) => {
   }
 
   pushPlayers(store, result.affected);
-  res.json({ ok: true });
+  pushNotice([to], `${getPlayer(store, from)?.name || "A player"} invited you to a match.`);
+  res.json({ ok: true, ...actorPayload(store, from) });
 });
 
 app.post("/api/invites/:inviteId/accept", requireAuth, async (req, res) => {
@@ -600,18 +666,27 @@ app.post("/api/invites/:inviteId/accept", requireAuth, async (req, res) => {
   }
 
   pushPlayers(store, result.affected);
-  res.json({ ok: true, game: serializeGame(result.game, viewerId) });
+  pushNotice(result.affected, `${result.game.players[0].name} vs ${result.game.players[1].name} is live.`);
+  res.json({ ok: true, ...actorPayload(store, viewerId) });
 });
 
 app.post("/api/invites/:inviteId/decline", requireAuth, async (req, res) => {
+  const viewerId = req.auth.player.id;
   const { store, result } = await withStore(async (draft) => {
     const invite = draft.invites.find((entry) => entry.id === req.params.inviteId);
     if (!invite) {
       return { error: "Invite not found.", status: 404 };
     }
+    if (invite.to !== viewerId && invite.from !== viewerId) {
+      return { error: "Invite not found.", status: 404 };
+    }
 
     draft.invites = draft.invites.filter((entry) => entry.id !== invite.id);
-    return { affected: [invite.from, invite.to] };
+    return {
+      affected: [invite.from, invite.to],
+      invite,
+      action: invite.to === viewerId ? "declined" : "cancelled"
+    };
   });
 
   if (result.error) {
@@ -620,7 +695,12 @@ app.post("/api/invites/:inviteId/decline", requireAuth, async (req, res) => {
   }
 
   pushPlayers(store, result.affected);
-  res.json({ ok: true });
+  if (result.action === "declined") {
+    pushNotice([result.invite.from], `${getPlayer(store, result.invite.to)?.name || "A player"} declined your invite.`);
+  } else {
+    pushNotice([result.invite.to], `${getPlayer(store, result.invite.from)?.name || "A player"} cancelled the invite.`);
+  }
+  res.json({ ok: true, ...actorPayload(store, viewerId) });
 });
 
 app.post("/api/matchmaking/join", requireAuth, async (req, res) => {
@@ -647,22 +727,22 @@ app.post("/api/matchmaking/join", requireAuth, async (req, res) => {
 
   pushPlayers(store, result.affected);
   if (result.matched) {
-    res.json({ ok: true, matched: true, game: serializeGame(result.game, playerId) });
+    res.json({ ok: true, matched: true, ...actorPayload(store, playerId) });
     return;
   }
 
-  res.json({ ok: true, matched: false });
+  res.json({ ok: true, matched: false, ...actorPayload(store, playerId) });
 });
 
 app.post("/api/matchmaking/leave", requireAuth, async (req, res) => {
   const playerId = req.auth.player.id;
-  const { store } = await withStore(async (draft) => {
+  const { store, result } = await withStore(async (draft) => {
     draft.queue = draft.queue.filter((entry) => entry.playerId !== playerId);
-    return {};
+    return { dashboard: buildDashboard(draft, playerId) };
   });
 
   pushDashboard(store, playerId);
-  res.json({ ok: true });
+  res.json({ ok: true, ...actorPayload(store, playerId) });
 });
 
 app.post("/api/games/:gameId/save", requireAuth, async (req, res) => {
@@ -686,7 +766,8 @@ app.post("/api/games/:gameId/save", requireAuth, async (req, res) => {
   }
 
   pushPlayers(store, result.affected);
-  res.json({ ok: true });
+  pushNotice(result.affected, "This match was saved and can be restored later.");
+  res.json({ ok: true, ...actorPayload(store, req.auth.player.id) });
 });
 
 app.post("/api/games/:gameId/restore", requireAuth, async (req, res) => {
@@ -711,7 +792,8 @@ app.post("/api/games/:gameId/restore", requireAuth, async (req, res) => {
   }
 
   pushPlayers(store, result.affected);
-  res.json({ ok: true, game: serializeGame(result.game, viewerId) });
+  pushNotice(result.affected, "A saved match was restored.");
+  res.json({ ok: true, ...actorPayload(store, viewerId) });
 });
 
 app.post("/api/games/:gameId/forfeit", requireAuth, async (req, res) => {
@@ -736,7 +818,8 @@ app.post("/api/games/:gameId/forfeit", requireAuth, async (req, res) => {
   }
 
   pushPlayers(store, result.affected);
-  res.json({ ok: true });
+  pushNotice(result.affected, "The match ended by forfeit.");
+  res.json({ ok: true, ...actorPayload(store, req.auth.player.id) });
 });
 
 app.post("/api/games/:gameId/action", requireAuth, async (req, res) => {
@@ -755,7 +838,7 @@ app.post("/api/games/:gameId/action", requireAuth, async (req, res) => {
     settleFinishedGame(draft, game);
     return {
       affected: game.playerIds,
-      game: game.status === "active" ? game : null
+      game
     };
   });
 
@@ -765,7 +848,41 @@ app.post("/api/games/:gameId/action", requireAuth, async (req, res) => {
   }
 
   pushPlayers(store, result.affected);
-  res.json({ ok: true, game: serializeGame(result.game, viewerId) });
+  if (result.game?.history?.[0]) {
+    pushNotice(result.affected, result.game.history[0]);
+  }
+  res.json({ ok: true, ...actorPayload(store, viewerId) });
+});
+
+app.post("/api/games/:gameId/close", requireAuth, async (req, res) => {
+  const viewerId = req.auth.player.id;
+  const { store, result } = await withStore(async (draft) => {
+    const game = getGame(draft, req.params.gameId);
+    if (!game || !game.playerIds.includes(viewerId)) {
+      return { error: "Game not found.", status: 404 };
+    }
+    if (game.status !== "finished") {
+      return { error: "Only finished games can be closed.", status: 400 };
+    }
+
+    draft.games = draft.games.filter((entry) => entry.id !== game.id);
+    game.playerIds.forEach((playerId) => {
+      const player = getPlayer(draft, playerId);
+      if (player?.activeGameId === game.id) {
+        player.activeGameId = null;
+      }
+    });
+
+    return { affected: game.playerIds };
+  });
+
+  if (result.error) {
+    res.status(result.status || 400).json({ error: result.error });
+    return;
+  }
+
+  pushPlayers(store, result.affected);
+  res.json({ ok: true, ...actorPayload(store, viewerId) });
 });
 
 app.use((req, res, next) => {
@@ -792,10 +909,20 @@ io.on("connection", async (socket) => {
   const sockets = socketsByPlayer.get(playerId) || [];
   sockets.push(socket);
   socketsByPlayer.set(playerId, sockets);
+  markPlayerActive(playerId);
+  idleStateByPlayer.set(playerId, false);
 
   const store = await readStore();
   pushDashboard(store, playerId);
   pushGame(store, playerId);
+  pushAllOnlineDashboards(store);
+
+  socket.on("presence:active", () => {
+    markPlayerActive(playerId);
+    if (syncIdleState(playerId)) {
+      broadcastAllOnlineDashboards().catch(() => {});
+    }
+  });
 
   socket.on("disconnect", () => {
     const remaining = (socketsByPlayer.get(playerId) || []).filter((entry) => entry.id !== socket.id);
@@ -803,9 +930,19 @@ io.on("connection", async (socket) => {
       socketsByPlayer.set(playerId, remaining);
     } else {
       socketsByPlayer.delete(playerId);
+      presenceByPlayer.delete(playerId);
+      idleStateByPlayer.delete(playerId);
     }
+    broadcastAllOnlineDashboards().catch(() => {});
   });
 });
+
+setInterval(() => {
+  const idleTransitionDetected = [...socketsByPlayer.keys()].some((playerId) => syncIdleState(playerId));
+  if (idleTransitionDetected) {
+    broadcastAllOnlineDashboards().catch(() => {});
+  }
+}, PRESENCE_SWEEP_MS);
 
 async function main() {
   await initDatabase();

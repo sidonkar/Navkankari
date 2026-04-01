@@ -1,5 +1,4 @@
 import {
-  PLAYER_COLORS,
   GRID_POSITIONS,
   BOARD_LINES,
   getLegalMoves,
@@ -15,13 +14,15 @@ const state = {
   user: null,
   dashboard: null,
   game: null,
+  authMode: "login",
   selectedNode: null,
   toasts: [],
   socket: null,
-  config: {
-    colors: PLAYER_COLORS
-  }
+  config: {}
 };
+
+let lastPresencePingAt = 0;
+let presenceTrackingReady = false;
 
 const STAGE_COPY = {
   placement: "Place one pawn on any empty highlighted position.",
@@ -84,6 +85,26 @@ function saveSession(payload) {
   render();
 }
 
+function applyLocalState(payload) {
+  if (!payload) {
+    return;
+  }
+  if (payload.user) {
+    state.user = payload.user;
+  }
+  if (Object.hasOwn(payload, "dashboard")) {
+    state.dashboard = payload.dashboard;
+  }
+  if (Object.hasOwn(payload, "game")) {
+    state.game = payload.game;
+    if (!payload.game) {
+      state.selectedNode = null;
+    } else if (state.selectedNode && payload.game.board[state.selectedNode] !== state.user.id) {
+      state.selectedNode = null;
+    }
+  }
+}
+
 function logout() {
   if (state.socket) {
     state.socket.disconnect();
@@ -96,6 +117,43 @@ function logout() {
   state.game = null;
   state.selectedNode = null;
   render();
+}
+
+function reportPresence(force = false) {
+  if (!state.socket?.connected) {
+    return;
+  }
+  const now = Date.now();
+  if (!force && now - lastPresencePingAt < 20000) {
+    return;
+  }
+  lastPresencePingAt = now;
+  state.socket.emit("presence:active");
+}
+
+function ensurePresenceTracking() {
+  if (presenceTrackingReady) {
+    return;
+  }
+  presenceTrackingReady = true;
+
+  ["pointerdown", "keydown", "touchstart", "mousemove"].forEach((eventName) => {
+    window.addEventListener(eventName, () => reportPresence(), { passive: true });
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      reportPresence(true);
+    }
+  });
+
+  window.addEventListener("focus", () => {
+    reportPresence(true);
+  });
+
+  window.setInterval(() => {
+    reportPresence();
+  }, 30000);
 }
 
 function connectSocket(reconnect = false) {
@@ -115,6 +173,12 @@ function connectSocket(reconnect = false) {
     auth: { token: state.token }
   });
 
+  ensurePresenceTracking();
+
+  state.socket.on("connect", () => {
+    reportPresence(true);
+  });
+
   state.socket.on("dashboard:update", (dashboard) => {
     state.dashboard = dashboard;
     if (dashboard?.player) {
@@ -131,6 +195,12 @@ function connectSocket(reconnect = false) {
       state.selectedNode = null;
     }
     render();
+  });
+
+  state.socket.on("notice", (payload) => {
+    if (payload?.message) {
+      toast(payload.message);
+    }
   });
 
   state.socket.on("connect_error", () => {
@@ -253,8 +323,9 @@ async function handleRegister(event) {
     method: "POST",
     body: {
       name: form.get("name"),
+      email: form.get("email"),
+      phone: form.get("phone"),
       password: form.get("password"),
-      favoriteColor: form.get("favoriteColor")
     }
   });
   saveSession(payload);
@@ -275,71 +346,71 @@ async function handleLogin(event) {
   toast(`Welcome back, ${payload.user.name}.`);
 }
 
-async function handleGuest() {
-  const payload = await api("/api/auth/guest", {
+async function handleForgotPassword(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const name = String(form.get("name") || "").trim();
+  const email = String(form.get("email") || "").trim();
+  const password = String(form.get("password") || "");
+  const confirmPassword = String(form.get("confirmPassword") || "");
+
+  if (password !== confirmPassword) {
+    throw new Error("The new passwords do not match.");
+  }
+
+  await api("/api/auth/forgot-password", {
     method: "POST",
     body: {
-      favoriteColor: PLAYER_COLORS[1].value
+      name,
+      email,
+      password
     }
   });
-  saveSession(payload);
-  toast(`${payload.user.name} joined as guest.`);
-}
 
-async function updateColor() {
-  const select = document.getElementById("favorite-color-select");
-  if (!select) {
-    return;
-  }
-  await api("/api/profile/color", {
-    method: "POST",
-    body: { favoriteColor: select.value }
-  });
-  toast("Pawn color updated.");
+  state.authMode = "login";
+  render();
+  toast("Password updated. You can log in now.");
 }
 
 async function sendInvite(opponentId) {
-  await api("/api/invites", {
+  const payload = await api("/api/invites", {
     method: "POST",
     body: { opponentId }
   });
+  applyLocalState(payload);
+  render();
   toast("Invite sent.");
 }
 
 async function acceptInvite(inviteId) {
   const payload = await api(`/api/invites/${inviteId}/accept`, { method: "POST" });
-  state.game = payload.game;
-  state.selectedNode = null;
+  applyLocalState(payload);
   render();
 }
 
 async function declineInvite(inviteId) {
-  await api(`/api/invites/${inviteId}/decline`, { method: "POST" });
+  const payload = await api(`/api/invites/${inviteId}/decline`, { method: "POST" });
+  applyLocalState(payload);
+  render();
 }
 
-async function joinQueue() {
-  const payload = await api("/api/matchmaking/join", { method: "POST" });
-  if (!payload.matched) {
-    toast("Open challenge posted. We'll match you when someone close in rank is ready.");
-  }
-}
-
-async function leaveQueue() {
-  await api("/api/matchmaking/leave", { method: "POST" });
+async function cancelInvite(inviteId) {
+  const payload = await api(`/api/invites/${inviteId}/decline`, { method: "POST" });
+  applyLocalState(payload);
+  render();
 }
 
 async function saveCurrentGame() {
   if (!state.game) return;
-  await api(`/api/games/${state.game.id}/save`, { method: "POST" });
-  state.game = null;
-  state.selectedNode = null;
+  const payload = await api(`/api/games/${state.game.id}/save`, { method: "POST" });
+  applyLocalState(payload);
+  render();
   toast("Game saved. You can restore it later.");
 }
 
 async function restoreGame(gameId) {
   const payload = await api(`/api/games/${gameId}/restore`, { method: "POST" });
-  state.game = payload.game;
-  state.selectedNode = null;
+  applyLocalState(payload);
   render();
 }
 
@@ -348,9 +419,16 @@ async function forfeitCurrentGame() {
   if (!window.confirm("Forfeit this match? It will count as a loss and end the game immediately.")) {
     return;
   }
-  await api(`/api/games/${state.game.id}/forfeit`, { method: "POST" });
-  state.game = null;
-  state.selectedNode = null;
+  const payload = await api(`/api/games/${state.game.id}/forfeit`, { method: "POST" });
+  applyLocalState(payload);
+  render();
+}
+
+async function closeFinishedGame() {
+  if (!state.game) return;
+  const payload = await api(`/api/games/${state.game.id}/close`, { method: "POST" });
+  applyLocalState(payload);
+  render();
 }
 
 async function sendGameAction(body) {
@@ -359,10 +437,8 @@ async function sendGameAction(body) {
     method: "POST",
     body
   });
-  state.game = payload.game;
-  if (!payload.game) {
-    state.selectedNode = null;
-  }
+  applyLocalState(payload);
+  render();
 }
 
 async function handleBoardClick(node) {
@@ -413,7 +489,7 @@ function render() {
     <div class="shell">
       ${renderHero()}
       ${state.game ? renderGame() : renderDashboard()}
-      <div class="footer-note">Persistent local accounts, realtime play, matchmaking, saves, and resumable matches.</div>
+      <div class="footer-note">Navkankari brings the classic board into a brighter, smoother live-play experience.</div>
     </div>
     <div class="toast-wrap"></div>
   `;
@@ -429,61 +505,87 @@ function renderHero() {
         <h1>Navkankari</h1>
         <p>A modern local multiplayer arena for the classic nine-pawn strategy battle. Build mills, pound relentlessly, capture cleanly, and outmaneuver your rival across the exact 24-point field.</p>
       </div>
-      <div class="hero-badges">
-        <div class="pill">2 players · 9 pawns each</div>
-        <div class="pill">Placement, Movement, Fly</div>
-        <div class="pill">Persistent account: ${state.user.name}</div>
-        <div class="pill">Rank tier: ${rankTier(state.user.rating)}</div>
+      <div class="hero-side">
+        ${state.user ? `
+          <div class="hero-user">
+            <span class="tag">Signed in as <strong>${state.user.name}</strong></span>
+            <button id="logout-btn" class="btn-secondary" type="button">Logout</button>
+          </div>
+        ` : `
+          <div class="hero-badges">
+            <span class="pill">Invite-based play</span>
+            <span class="pill">Realtime sync</span>
+            <span class="pill">Save and restore</span>
+          </div>
+        `}
       </div>
     </section>
   `;
 }
 
 function renderAuthShell() {
+  const authTitle = state.authMode === "register"
+    ? "Create your player account"
+    : state.authMode === "recover"
+      ? "Recover your password"
+      : "Welcome back";
+  const authSubtitle = state.authMode === "register"
+    ? "Set up your account with your name, email, and phone number, then step straight into your first match."
+    : state.authMode === "recover"
+      ? "Verify your player name and email, then set a new password."
+      : "Sign in to continue your matches, invites, and saved games.";
+
   return `
     <div class="shell">
       <section class="hero">
         <div class="hero-copy">
           <h1>Navkankari</h1>
-          <p>Create an account, jump in as a guest, and play live matches with saved progress, invitations, matchmaking, rankings, and resumable games.</p>
+          <p>Create an account, sign in, and play live invite-based matches with saved progress, rankings, and resumable games.</p>
         </div>
         <div class="hero-badges">
-          <div class="pill">Persistent local accounts</div>
-          <div class="pill">Live matchmaking</div>
-          <div class="pill">Save and restore games</div>
+          <span class="pill">Two-player duels</span>
+          <span class="pill">Live invites</span>
+          <span class="pill">Fast rematches</span>
         </div>
       </section>
       <section class="auth-grid">
         <div class="auth-card">
-          <div class="section-head">
+          <div class="auth-head">
             <div>
-              <h2>Enter The Arena</h2>
-              <div class="muted">Choose the fastest way to start playing.</div>
+              <h2>${authTitle}</h2>
+              <div class="muted">${authSubtitle}</div>
+            </div>
+            <div class="auth-links">
+              <button id="go-login-btn" class="auth-link ${state.authMode === "login" ? "auth-link-active" : ""}" type="button">Login</button>
             </div>
           </div>
           <div class="auth-stack">
-            <form id="register-form" class="form-grid">
+            ${state.authMode === "register" ? `<form id="register-form" class="form-grid">
               <h3>Create account</h3>
               <label>Player name<input name="name" maxlength="24" placeholder="Choose a display name"></label>
+              <label>Email address<input type="email" name="email" maxlength="120" placeholder="you@example.com"></label>
+              <label>Phone number<input type="tel" name="phone" maxlength="20" placeholder="Your mobile number"></label>
               <label>Password<input type="password" name="password" maxlength="40" placeholder="Create a password"></label>
-              <label>Pawn color
-                <select name="favoriteColor">
-                  ${PLAYER_COLORS.map((color) => `<option value="${color.value}">${color.name}</option>`).join("")}
-                </select>
-              </label>
               <button class="btn-primary" type="submit">Register & Play</button>
-            </form>
-            <form id="login-form" class="form-grid">
+              <div class="auth-footnote">Already have an account? <button id="switch-to-login-btn" class="text-link" type="button">Login</button></div>
+            </form>` : state.authMode === "recover" ? `<form id="recover-form" class="form-grid">
+              <h3>Reset password</h3>
+              <label>Player name<input name="name" maxlength="24" placeholder="Your player name"></label>
+              <label>Email address<input type="email" name="email" maxlength="120" placeholder="Email used to register"></label>
+              <label>New password<input type="password" name="password" maxlength="40" placeholder="Choose a new password"></label>
+              <label>Confirm new password<input type="password" name="confirmPassword" maxlength="40" placeholder="Type it again"></label>
+              <button class="btn-primary" type="submit">Update password</button>
+              <div class="auth-footnote">Remembered it? <button id="switch-to-login-btn" class="text-link" type="button">Back to login</button></div>
+            </form>` : `<form id="login-form" class="form-grid">
               <h3>Login</h3>
               <label>Player name<input name="name" maxlength="24" placeholder="Existing player"></label>
               <label>Password<input type="password" name="password" maxlength="40" placeholder="Your password"></label>
-              <button class="btn-secondary" type="submit">Login</button>
-            </form>
-            <div class="card-lite">
-              <h3>Play as guest</h3>
-              <p class="muted">Guests can play instantly. Registered players keep their ranking history across sessions.</p>
-              <button id="guest-btn" class="btn-ghost" type="button">Play as Guest</button>
-            </div>
+              <button class="btn-primary" type="submit">Login</button>
+              <div class="auth-inline-row">
+                <button id="switch-to-recover-btn" class="text-link" type="button">Forgot password?</button>
+                <button id="switch-to-register-btn" class="text-link" type="button">Create account</button>
+              </div>
+            </form>`}
           </div>
         </div>
         <div class="auth-card">
@@ -509,6 +611,7 @@ function renderAuthShell() {
           </div>
         </div>
       </section>
+      <div class="footer-note">Navkankari brings the classic board into a brighter, smoother live-play experience.</div>
       <div class="toast-wrap"></div>
     </div>
   `;
@@ -522,10 +625,7 @@ function renderDashboard() {
         <div class="section-head">
           <div>
             <h2>Dashboard</h2>
-            <div class="muted">Invite friends, queue up, or resume your saved battles.</div>
-          </div>
-          <div class="button-row">
-            <button id="logout-btn" class="btn-secondary" type="button">Logout</button>
+            <div class="muted">Invite another player directly or resume your saved battles.</div>
           </div>
         </div>
 
@@ -538,24 +638,13 @@ function renderDashboard() {
 
         <div class="mini-grid" style="margin-top:16px;">
           <div class="card-lite">
-            <h3>Your style</h3>
-            <div class="muted">Choose the pawn color used in your next match. Tier: <strong class="accent">${rankTier(state.user.rating)}</strong>.</div>
-            <label style="margin-top:12px;">Pawn color
-              <select id="favorite-color-select">
-                ${PLAYER_COLORS.map((color) => `<option value="${color.value}" ${state.user.favoriteColor === color.value ? "selected" : ""}>${color.name}</option>`).join("")}
-              </select>
-            </label>
-            <div class="button-row" style="margin-top:12px;">
-              <button id="save-color-btn" class="btn-secondary" type="button">Save Color</button>
-              <span class="tag"><span class="dot" style="color:${state.user.favoriteColor}; background:${state.user.favoriteColor};"></span>Current</span>
-            </div>
-          </div>
-          <div class="card-lite">
             <h3>Current session</h3>
             <div class="list compact-list" style="margin-top:12px;">
+              <div class="inline-stat"><span class="muted">Tier</span><strong>${rankTier(state.user.rating)}</strong></div>
               <div class="inline-stat"><span class="muted">Win rate</span><strong>${winRate(state.user)}</strong></div>
-              <div class="inline-stat"><span class="muted">Queue status</span><strong>${dashboard.inQueue ? "Queued" : "Idle"}</strong></div>
+              <div class="inline-stat"><span class="muted">Presence</span><strong>${state.user.idle ? "Idle" : "Active"}</strong></div>
               <div class="inline-stat"><span class="muted">Live game</span><strong>${dashboard.activeGameId ? "In progress" : "None"}</strong></div>
+              <div class="inline-stat"><span class="muted">Pending invites</span><strong>${dashboard.incomingInvites.length + dashboard.outgoingInvites.length}</strong></div>
             </div>
             <div class="button-row" style="margin-top:12px;">
               <button id="resume-game-btn" class="btn-primary" type="button" ${dashboard.activeGameId ? "" : "disabled"}>Resume Active Game</button>
@@ -566,21 +655,17 @@ function renderDashboard() {
         <div class="coach-card" style="margin-top:16px;">
           <div>
             <strong>${dashboard.activeGameId ? "Your match is waiting" : "Ready for another great game?"}</strong>
-            <div class="muted">${dashboard.activeGameId ? "You can only play one live game at a time until it is saved or finished." : "Join the open pool for live matchmaking or invite a specific opponent directly."}</div>
+            <div class="muted">${dashboard.activeGameId ? "You can only play one live game at a time until it is saved or finished." : "Invite a specific opponent to start a live head-to-head match."}</div>
           </div>
-          <span class="tag ${dashboard.activeGameId ? "danger" : "success"}">${dashboard.activeGameId ? "One active game only" : "Free to queue"}</span>
+          <span class="tag ${dashboard.activeGameId ? "danger" : "success"}">${dashboard.activeGameId ? "One active game only" : "Free to invite"}</span>
         </div>
 
         <div class="panel card-lite" style="margin-top:16px;">
           <div class="section-head">
             <div>
-              <h3>Start Playing</h3>
-              <div class="muted">Live matchmaking pairs you with players of similar ranking.</div>
+              <h3>Invite a Player</h3>
+              <div class="muted">Pick an available player and send a direct challenge.</div>
             </div>
-          </div>
-          <div class="action-grid">
-            <button id="open-pool-btn" class="btn-primary" type="button" ${dashboard.activeGameId ? "disabled" : ""}>${dashboard.inQueue ? "Refresh Open Match" : "Join Open Match Pool"}</button>
-            <button id="leave-pool-btn" class="btn-secondary" type="button" ${dashboard.inQueue ? "" : "disabled"}>Leave Pool</button>
           </div>
           <div class="players-grid" style="margin-top:14px;">
             ${dashboard.availablePlayers.length ? dashboard.availablePlayers.map((entry) => `
@@ -590,13 +675,13 @@ function renderDashboard() {
                     <strong>${entry.name}</strong>
                     <div class="muted">${rankTier(entry.rating)} | Ranking ${entry.rating}</div>
                   </div>
-                  <span class="tag"><span class="dot" style="color:${entry.favoriteColor}; background:${entry.favoriteColor};"></span>${entry.guest ? "Guest" : "Ready"}</span>
+                  <span class="tag">Ready</span>
                 </div>
                 <div class="button-row">
                   <button class="btn-ghost invite-btn" data-player-id="${entry.id}" type="button" ${dashboard.activeGameId ? "disabled" : ""}>Invite</button>
                 </div>
               </div>
-            `).join("") : `<div class="empty-state">No free players right now. Open another browser window to create another account, or wait in the queue.</div>`}
+            `).join("") : `<div class="empty-state">No free players right now. Open another browser window to create another account, or wait for another player to log in.</div>`}
           </div>
         </div>
 
@@ -617,30 +702,22 @@ function renderDashboard() {
             </div>
           </div>
           <div class="card-lite">
-            <h3>Open pool nearby</h3>
+            <h3>Sent invites</h3>
             <div class="match-list">
-              ${dashboard.openChallenges.length ? dashboard.openChallenges.map((entry) => `
+              ${dashboard.outgoingInvites.length ? dashboard.outgoingInvites.map((invite) => `
                 <div class="match-card">
-                  <strong>${entry.name}</strong>
-                  <div class="muted">${rankTier(entry.rating)} | Rating gap ${Math.abs(entry.rating - state.user.rating)}</div>
+                  <strong>${invite.toPlayer.name}</strong>
+                  <div class="muted">Waiting for a response to your challenge.</div>
+                  <div class="button-row" style="margin-top:12px;">
+                    <button class="btn-secondary cancel-invite-btn" data-invite-id="${invite.id}" type="button">Cancel Invite</button>
+                  </div>
                 </div>
-              `).join("") : `<div class="empty-state">Nobody else is waiting in the queue yet.</div>`}
+              `).join("") : `<div class="empty-state">No sent invites waiting on a response.</div>`}
             </div>
           </div>
         </div>
 
         <div class="mini-grid" style="margin-top:16px;">
-          <div class="card-lite">
-            <h3>Sent invites</h3>
-            <div class="list">
-              ${dashboard.outgoingInvites.length ? dashboard.outgoingInvites.map((invite) => `
-                <div class="match-card">
-                  <strong>${invite.toPlayer.name}</strong>
-                  <div class="muted">Waiting for response.</div>
-                </div>
-              `).join("") : `<div class="empty-state">No pending invites.</div>`}
-            </div>
-          </div>
           <div class="card-lite">
             <h3>Saved games</h3>
             <div class="saved-list">
@@ -690,6 +767,7 @@ function renderGame() {
   const me = getMyParticipant(game);
   const opponent = getOpponentParticipant(game);
   const millOwners = game.millOwners || {};
+  const boardStageClass = `board-shell board-stage-${game.stage}`;
   const myMoves = Object.keys(game.board)
     .filter((node) => game.board[node] === state.user.id)
     .reduce((sum, node) => sum + getLegalMoves(game, node, state.user.id).length, 0);
@@ -697,22 +775,25 @@ function renderGame() {
     .filter((node) => game.board[node] === opponent.id)
     .reduce((sum, node) => sum + getLegalMoves(game, node, opponent.id).length, 0);
 
+  const finished = game.status === "finished";
+  const winner = game.players.find((entry) => entry.id === game.winnerId);
   return `
     <section class="game-grid">
       <div class="game-card board-wrap">
         <div class="turn-banner">
           <div class="turn-main">
             <div class="tag"><span class="dot" style="color:${me.color}; background:${me.color};"></span>${me.name}</div>
-            <h2>${game.pendingCaptureBy === state.user.id ? "Capture an opponent pawn" : game.turn === state.user.id ? `Your turn | ${formatStage(playerStage(game, state.user.id))}` : `${opponent.name}'s turn`}</h2>
-            <div class="muted">${boardStagePrompt(game)}</div>
+            <h2>${finished ? `${winner?.name || "Winner"} wins` : game.pendingCaptureBy === state.user.id ? "Capture an opponent pawn" : game.turn === state.user.id ? `Your turn | ${formatStage(playerStage(game, state.user.id))}` : `${opponent.name}'s turn`}</h2>
+            <div class="muted">${finished ? (game.winnerReason || "The match is over.") : boardStagePrompt(game)}</div>
           </div>
           <div class="button-row">
-            <button id="save-game-btn" class="btn-ghost" type="button">Save & Exit</button>
-            <button id="forfeit-btn" class="btn-danger" type="button">Forfeit</button>
+            ${finished ? `<button id="close-game-btn" class="btn-primary" type="button">Close Match</button>` : `<button id="save-game-btn" class="btn-ghost" type="button">Save & Exit</button><button id="forfeit-btn" class="btn-danger" type="button">Forfeit</button>`}
+        
           </div>
         </div>
-        <div class="board-shell">
+        <div class="${boardStageClass}">
           <div class="board">
+            <div class="board-stage-badge">${formatStage(game.stage)} phase</div>
             <div class="board-center-glow"></div>
             ${BOARD_LINES.map((line) => line.type === "horizontal"
               ? `<div class="board-line horizontal" style="left:${line.left}%; top:${line.top}%; width:${line.width}%"></div>`
@@ -774,7 +855,7 @@ function renderGame() {
         <div class="game-card">
           <h3>How to play this turn</h3>
           <div class="timeline">
-            <div class="timeline-item">${boardStagePrompt(game)}</div>
+            <div class="timeline-item">${finished ? (game.winnerReason || "The match is over.") : boardStagePrompt(game)}</div>
             <div class="timeline-item">${latestMoveSummary(game)}</div>
             <div class="timeline-item">Pounding is allowed. You may break your own mill and reform it on a later turn to capture again.</div>
             <div class="timeline-item">Victory comes after 7 captures or when your opponent has no legal move left.</div>
@@ -805,27 +886,47 @@ function renderGame() {
 }
 
 function bindAuthEvents() {
+  document.getElementById("go-login-btn")?.addEventListener("click", () => {
+    state.authMode = "login";
+    render();
+  });
+  document.getElementById("go-register-btn")?.addEventListener("click", () => {
+    state.authMode = "register";
+    render();
+  });
+  document.getElementById("go-recover-btn")?.addEventListener("click", () => {
+    state.authMode = "recover";
+    render();
+  });
+  document.getElementById("switch-to-login-btn")?.addEventListener("click", () => {
+    state.authMode = "login";
+    render();
+  });
+  document.getElementById("switch-to-register-btn")?.addEventListener("click", () => {
+    state.authMode = "register";
+    render();
+  });
+  document.getElementById("switch-to-recover-btn")?.addEventListener("click", () => {
+    state.authMode = "recover";
+    render();
+  });
   document.getElementById("register-form")?.addEventListener("submit", (event) => {
     handleRegister(event).catch((error) => toast(error.message));
   });
   document.getElementById("login-form")?.addEventListener("submit", (event) => {
     handleLogin(event).catch((error) => toast(error.message));
   });
-  document.getElementById("guest-btn")?.addEventListener("click", () => {
-    handleGuest().catch((error) => toast(error.message));
+  document.getElementById("recover-form")?.addEventListener("submit", (event) => {
+    handleForgotPassword(event).catch((error) => toast(error.message));
   });
 }
 
 function bindAppEvents() {
   document.getElementById("logout-btn")?.addEventListener("click", logout);
-  document.getElementById("save-color-btn")?.addEventListener("click", () => {
-    updateColor().catch((error) => toast(error.message));
-  });
   document.getElementById("resume-game-btn")?.addEventListener("click", () => render());
-  document.getElementById("open-pool-btn")?.addEventListener("click", () => joinQueue().catch((error) => toast(error.message)));
-  document.getElementById("leave-pool-btn")?.addEventListener("click", () => leaveQueue().catch((error) => toast(error.message)));
   document.getElementById("save-game-btn")?.addEventListener("click", () => saveCurrentGame().catch((error) => toast(error.message)));
   document.getElementById("forfeit-btn")?.addEventListener("click", () => forfeitCurrentGame().catch((error) => toast(error.message)));
+  document.getElementById("close-game-btn")?.addEventListener("click", () => closeFinishedGame().catch((error) => toast(error.message)));
 
   document.querySelectorAll(".invite-btn").forEach((button) => {
     button.addEventListener("click", () => sendInvite(button.dataset.playerId).catch((error) => toast(error.message)));
@@ -837,6 +938,10 @@ function bindAppEvents() {
 
   document.querySelectorAll(".decline-invite-btn").forEach((button) => {
     button.addEventListener("click", () => declineInvite(button.dataset.inviteId).catch((error) => toast(error.message)));
+  });
+
+  document.querySelectorAll(".cancel-invite-btn").forEach((button) => {
+    button.addEventListener("click", () => cancelInvite(button.dataset.inviteId).catch((error) => toast(error.message)));
   });
 
   document.querySelectorAll(".restore-btn").forEach((button) => {

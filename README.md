@@ -2,12 +2,12 @@
 
 Navkankari is now a full-stack web app with:
 
-- persistent accounts and guest mode
-- live invitations and open-pool matchmaking
+- persistent accounts
+- live invitations for direct two-player matches
 - realtime gameplay updates over sockets
 - save and restore support
 - rankings, leaderboard, wins, losses, and one-live-game enforcement
-- Render-ready PostgreSQL persistence
+- Render-ready PostgreSQL persistence, including external Neon support
 - production build output with minification and JavaScript obfuscation
 - a deploy-safe server bundle that is minified by default
 
@@ -22,9 +22,11 @@ Required:
 
 Optional:
 
-- `PORT`: local server port, defaults to `3000`
+- `PORT`: local server port, defaults to `7000`
 - `DATABASE_SSL_DISABLE`: set to `1` only if your local Postgres does not use SSL
 - `MIGRATE_JSON_ON_BOOT`: set to `1` to import the old `data/store.json` once if the database is empty
+
+Match colors are assigned automatically when a game is created. Saved games preserve those same colors when restored.
 
 ## Local development
 
@@ -44,13 +46,15 @@ npm run dev
 
 5. Open:
 
-`http://localhost:3000`
+`http://localhost:7000`
 
 6. For multiplayer testing on one machine:
 
 - open two browser windows or an incognito window
 - register two different accounts
-- invite between them or join the open pool from both
+- send an invite from one account and accept it from the other
+
+Registration requires `name`, `email`, `phone number`, and `password`. Password reset verifies `name + email` before allowing a new password.
 
 ## Production-style local deployment
 
@@ -69,7 +73,7 @@ npm start
 
 4. Open:
 
-`http://localhost:3000`
+`http://localhost:7000`
 
 The build command creates:
 
@@ -87,16 +91,17 @@ The build command creates:
 
 This repo includes [render.yaml](C:\Users\sidon\OneDrive\Documents\Navkankari\render.yaml) for Render Blueprint deployment.
 
-Recommended setup:
+Recommended setup with Neon:
 
 1. Push this repo to GitHub.
-2. In Render, create a Blueprint deploy from the repo.
-3. Let Render create:
-   - the web service
-   - the managed Postgres database
-4. Confirm these env vars exist:
-   - `DATABASE_URL`
+2. Create your Neon Postgres database and copy its connection string.
+3. In Render, create a Blueprint deploy from the repo.
+4. After the web service is created, add these env vars in Render:
+   - `DATABASE_URL` = your Neon connection string
    - `NAVKANKARI_SECRET`
+   - `NODE_VERSION=22`
+   - `MIGRATE_JSON_ON_BOOT=1`
+   - `DATABASE_SSL_DISABLE=0`
 5. Deploy.
 
 Build/start commands used on Render:
@@ -105,6 +110,12 @@ Build/start commands used on Render:
 Build: npm install && npm run build
 Start: npm start
 ```
+
+Notes:
+
+- The included `render.yaml` now creates only the web service
+- Neon is the external Postgres provider
+- `DATABASE_URL` should be added manually in the Render dashboard
 
 ## Notes on obfuscation
 

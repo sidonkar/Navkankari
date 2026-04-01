@@ -1,10 +1,6 @@
 export const PLAYER_COLORS = [
-  { name: "Marigold", value: "#f5be41" },
-  { name: "Coral", value: "#ff7a59" },
-  { name: "Ocean", value: "#4cb3ff" },
-  { name: "Mint", value: "#68dfb3" },
-  { name: "Ruby", value: "#e85f7b" },
-  { name: "Ivory", value: "#fff7e7" }
+  { name: "Red", value: "#e53935" },
+  { name: "Black", value: "#111111" }
 ];
 
 export const GRID_POSITIONS = {
@@ -110,7 +106,20 @@ export function createEmptyBoard() {
   return Object.fromEntries(Object.keys(GRID_POSITIONS).map((node) => [node, null]));
 }
 
+function colorSeed(value) {
+  return [...String(value || "")].reduce((sum, char, index) => sum + char.charCodeAt(0) * (index + 1), 0);
+}
+
+export function assignMatchColors(playerOneId, playerTwoId) {
+  const total = colorSeed(playerOneId) + colorSeed(playerTwoId);
+  const firstIndex = total % PLAYER_COLORS.length;
+  const offset = (colorSeed(playerOneId) * 3 + colorSeed(playerTwoId)) % (PLAYER_COLORS.length - 1);
+  const secondIndex = (firstIndex + offset + 1) % PLAYER_COLORS.length;
+  return [PLAYER_COLORS[firstIndex].value, PLAYER_COLORS[secondIndex].value];
+}
+
 export function createGameRecord({ id, playerOne, playerTwo, source }) {
+  const [playerOneColor, playerTwoColor] = assignMatchColors(playerOne.id, playerTwo.id);
   return {
     id,
     playerIds: [playerOne.id, playerTwo.id],
@@ -118,7 +127,7 @@ export function createGameRecord({ id, playerOne, playerTwo, source }) {
       {
         id: playerOne.id,
         name: playerOne.name,
-        color: playerOne.favoriteColor || PLAYER_COLORS[0].value,
+        color: playerOneColor,
         pawnsInHand: 9,
         pawnsOnBoard: 0,
         captures: 0
@@ -126,7 +135,7 @@ export function createGameRecord({ id, playerOne, playerTwo, source }) {
       {
         id: playerTwo.id,
         name: playerTwo.name,
-        color: playerTwo.favoriteColor || PLAYER_COLORS[2].value,
+        color: playerTwoColor,
         pawnsInHand: 9,
         pawnsOnBoard: 0,
         captures: 0
@@ -268,12 +277,17 @@ export function applyGameAction(game, playerId, action) {
     return { ok: false, error: "This game is no longer active." };
   }
 
+  const participant = getParticipant(game, playerId);
+  const opponent = getOpponent(game, playerId);
+
+  if (action.type === "forfeit") {
+    declareWinner(game, opponent.id, `${participant.name} forfeited the match.`);
+    return { ok: true };
+  }
+
   if (game.turn !== playerId && game.pendingCaptureBy !== playerId) {
     return { ok: false, error: "It is not your turn." };
   }
-
-  const participant = getParticipant(game, playerId);
-  const opponent = getOpponent(game, playerId);
 
   if (action.type === "capture") {
     if (game.pendingCaptureBy !== playerId) {
@@ -373,11 +387,6 @@ export function applyGameAction(game, playerId, action) {
 
     updateStageFromState(game);
     finishIfGameOver(game, playerId);
-    return { ok: true };
-  }
-
-  if (action.type === "forfeit") {
-    declareWinner(game, opponent.id, `${participant.name} forfeited the match.`);
     return { ok: true };
   }
 
